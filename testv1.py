@@ -1,21 +1,17 @@
 # ai_enhanced_chart_analyzer.py
-# End-to-end: PaddleX chart → JSON → structured table → Bedrock (Nova Lite) insights → saved outputs
+# End-to-end: PaddleX chart → JSON → structured table → Bedrock (Nova Lite) insights
 
 import os
-import re
 import json
 import pandas as pd
+from typing import Any, Dict, List, Optional, Tuple
 
-from typing import List, Tuple, Optional, Any, Dict
-
-# External deps
-#   pip install paddlex boto3
-from paddlex import create_model
-import boto3
+from paddlex import create_model      # pip install paddlex
+import boto3                          # pip install boto3
 from botocore.exceptions import ClientError
 
 # ===========================
-# Bedrock: AI Analyzer
+# Bedrock (Nova Lite) client
 # ===========================
 class ChartAnalyzerWithBedrock:
     def __init__(self, region_name: str = 'eu-west-1'):
@@ -41,25 +37,21 @@ class ChartAnalyzerWithBedrock:
             summary.append("\nNumeric Data:")
             for col in numeric_cols:
                 stats = df[col].describe()
-                # Use safe access for stats
-                try:
-                    mn = stats['min']
-                    mx = stats['max']
-                    mean = stats['mean']
-                except Exception:
-                    mn, mx, mean = df[col].min(), df[col].max(), df[col].mean()
-                summary.append(f"  {col}: min={mn}, max={mx}, mean={float(mean):.2f}")
+                mn = float(getattr(stats, 'min', df[col].min()))
+                mx = float(getattr(stats, 'max', df[col].max()))
+                mean = float(getattr(stats, 'mean', df[col].mean()))
+                summary.append(f"  {col}: min={mn}, max={mx}, mean={mean:.2f}")
 
         # Categorical columns
         categorical_cols = df.select_dtypes(include=['object', 'string']).columns
         if len(categorical_cols) > 0:
             summary.append("\nCategorical Data:")
             for col in categorical_cols:
-                unique_vals = df[col].dropna().unique().tolist()
-                if len(unique_vals) <= 10:
-                    summary.append(f"  {col}: {', '.join(map(str, unique_vals))}")
+                vals = df[col].dropna().unique().tolist()
+                if len(vals) <= 10:
+                    summary.append(f"  {col}: {', '.join(map(str, vals))}")
                 else:
-                    summary.append(f"  {col}: {len(unique_vals)} unique values")
+                    summary.append(f"  {col}: {len(vals)} unique values")
 
         # Sample data
         summary.append("\nSample Data (first 3 rows):")
@@ -70,34 +62,37 @@ class ChartAnalyzerWithBedrock:
 
         return '\n'.join(summary)
 
-    def _extract_nova_text(self, payload: Dict[str, Any]) -> str:
-        # Typical Nova-lite chat format
-        try:
-            out = payload.get('output', {})
-            msg = out.get('message', {})
-            content = msg.get('content', [])
-            if content and isinstance(content, list):
-                candidate = content[0]
-                if isinstance(candidate, dict) and 'text' in candidate:
-                    return candidate['text']
-        except Exception:
-            pass
-        # fallback: trimmed JSON for debugging
-        return json.dumps(payload, ensure_ascii=False)[:2000]
-
-    def get_ai_insights(self, table_data: pd.DataFrame, chart_context: str = "") -> str:
+    def get_ai_insights(
+        self,
+        table_data: pd.DataFrame,
+        chart_context: str = "",
+        raw_json_snippet: Optional[str] = None
+    ) -> str:
+        """Generate insights using Nova Lite via converse()."""
         if not self.bedrock:
             return "AI insights unavailable - Bedrock not initialized"
+
         try:
             data_summary = self._prepare_data_summary(table_data)
+            csv_preview = ""
+            try:
+                csv_preview = table_data.to_csv(index=False)
+            except Exception:
+                pass
+
+            raw_part = f"\nRaw JSON from chart-to-table (for your own parsing):\n{raw_json_snippet}\n" if raw_json_snippet else ""
+
             prompt = f"""
-You are a data analyst. Analyze the following chart data and provide insights:
+You are a data analyst. Analyze the following chart data and provide insights.
 
 Context: {chart_context}
 
-Data Summary:
+Structured data summary:
 {data_summary}
 
+CSV preview of the table:
+{csv_preview}
+{raw_part}
 Please provide:
 1) Key trends and patterns
 2) Notable data points or outliers
@@ -107,40 +102,38 @@ Please provide:
 Keep the analysis concise but insightful.
 """.strip()
 
-            response = self.bedrock.invoke_model(
+            response = self.bedrock.converse(
                 modelId="eu.amazon.nova-lite-v1:0",
-                contentType="application/json",
-                accept="application/json",
-                body=json.dumps({
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [{"text": prompt}]
-                        }
-                    ],
-                    "max_tokens": 1000,
-                    "temperature": 0.7
-                })
+                messages=[{
+                    "role": "user",
+                    "content": [{"text": prompt}]
+                }],
+                inferenceConfig={
+                    "maxTokens": 1000,     # ✅ correct key for Nova (NOT max_tokens)
+                    "temperature": 0.7,
+                    "topP": 0.9
+                }
             )
 
-            raw = response.get('body')
-            payload = json.loads(raw.read()) if hasattr(raw, 'read') else json.loads(raw)
-            return self._extract_nova_text(payload)
+            out = response.get("output", {})
+            msg = out.get("message", {})
+            content = msg.get("content", [])
+            if content and isinstance(content, list) and "text" in content[0]:
+                return content[0]["text"]
+
+            return json.dumps(response, ensure_ascii=False)[:2000]
 
         except ClientError as e:
             return f"Error getting AI insights: {str(e)}"
         except Exception as e:
             return f"Unexpected error: {str(e)}"
 
-
 # ===========================
-# Parsing Helpers
+# Parsing helpers
 # ===========================
 def parse_pipe_table(text: str) -> Optional[pd.DataFrame]:
     """
-    Parse a simple pipe-delimited table (as in your earlier JSON)
-    Example 'result' string:
-      "Year | metric1 | metric2\n2018 | 10 | 20\n2019 | 11 | 21"
+    Parse a simple pipe-delimited table (as seen in your earlier JSON "result" string).
     """
     if not text or not isinstance(text, str):
         return None
@@ -152,7 +145,6 @@ def parse_pipe_table(text: str) -> Optional[pd.DataFrame]:
     rows = []
     for line in lines:
         parts = [p.strip() for p in line.split('|')]
-        # Drop leading/trailing empty cells if surrounded by pipes
         if parts and parts[0] == '':
             parts = parts[1:]
         if parts and parts[-1] == '':
@@ -162,7 +154,6 @@ def parse_pipe_table(text: str) -> Optional[pd.DataFrame]:
     header = rows[0]
     data_rows = rows[1:]
 
-    # Normalize row length to header length
     fixed = []
     for r in data_rows:
         if len(r) < len(header):
@@ -173,18 +164,15 @@ def parse_pipe_table(text: str) -> Optional[pd.DataFrame]:
 
     df = pd.DataFrame(fixed, columns=header)
 
-    # Try to coerce numeric/percentage columns
+    # Coerce numeric / percentages where possible
     for col in df.columns:
         if df[col].dtype == 'object':
-            # Remove % then try numeric
-            df[col] = df[col].astype(str).str.replace('%', '', regex=False)
-            df[col] = pd.to_numeric(df[col], errors='ignore')
+            s = df[col].astype(str).str.replace('%', '', regex=False)
+            df[col] = pd.to_numeric(s, errors='ignore')
 
     return df
 
-
 def flatten_json(json_obj: Any, parent_key: str = '', sep: str = '_') -> Dict[str, Any]:
-    """Flatten nested JSON structure into a single dict."""
     items = []
     if isinstance(json_obj, dict):
         for k, v in json_obj.items():
@@ -198,9 +186,7 @@ def flatten_json(json_obj: Any, parent_key: str = '', sep: str = '_') -> Dict[st
                 items.append((new_key, v))
     return dict(items)
 
-
 def generate_summary(df: pd.DataFrame) -> Dict[str, Any]:
-    """Compute summary stats used in the final printout/JSON."""
     summary = {
         'total_rows': int(len(df)),
         'total_columns': int(len(df.columns)),
@@ -211,16 +197,14 @@ def generate_summary(df: pd.DataFrame) -> Dict[str, Any]:
 
     numeric_cols = df.select_dtypes(include=['number']).columns
     for col in numeric_cols:
-        try:
-            summary['key_insights'].append({
-                'column': str(col),
-                'min': float(pd.to_numeric(df[col], errors='coerce').min(skipna=True)),
-                'max': float(pd.to_numeric(df[col], errors='coerce').max(skipna=True)),
-                'mean': float(pd.to_numeric(df[col], errors='coerce').mean(skipna=True)),
-                'total': float(pd.to_numeric(df[col], errors='coerce').sum(skipna=True))
-            })
-        except Exception:
-            pass
+        col_series = pd.to_numeric(df[col], errors='coerce')
+        summary['key_insights'].append({
+            'column': str(col),
+            'min': float(col_series.min(skipna=True)),
+            'max': float(col_series.max(skipna=True)),
+            'mean': float(col_series.mean(skipna=True)),
+            'total': float(col_series.sum(skipna=True))
+        })
 
     categorical_cols = df.select_dtypes(include=['object', 'string']).columns
     for col in categorical_cols:
@@ -233,19 +217,15 @@ def generate_summary(df: pd.DataFrame) -> Dict[str, Any]:
 
     return summary
 
-
 # ===========================
-# Core: From PaddleX results → JSON → Structured → AI
+# Core pipeline
 # ===========================
 def create_table_and_summary_with_ai(
     json_data: Any,
     result_index: int,
-    analyzer: ChartAnalyzerWithBedrock
+    analyzer: ChartAnalyzerWithBedrock,
+    raw_json_for_prompt: Optional[str] = None
 ) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
-    """
-    Accepts the parsed JSON (from res.save_to_json file), creates a table, and gets AI insights.
-    Handles your earlier 'result' pipe-string shape too.
-    """
     table_data = None
     summary = {
         'result_index': result_index,
@@ -259,11 +239,11 @@ def create_table_and_summary_with_ai(
     }
 
     try:
-        # 1) Your earlier JSON shape: {"image": "...", "result": "<pipe table string>"}
+        # 1) Your earlier JSON: {"image": "...", "result": "<pipe table string>"}
         if isinstance(json_data, dict) and isinstance(json_data.get('result'), str):
             table_data = parse_pipe_table(json_data['result'])
 
-        # 2) Generic "table" or "data"
+        # 2) More generic shapes
         if table_data is None:
             if isinstance(json_data, dict) and 'table' in json_data:
                 table_data = pd.DataFrame(json_data['table'])
@@ -275,42 +255,36 @@ def create_table_and_summary_with_ai(
             elif isinstance(json_data, list):
                 table_data = pd.DataFrame(json_data)
             else:
-                # 3) Fallback: flatten an arbitrary dict
                 if isinstance(json_data, dict):
                     flat = flatten_json(json_data)
                     if flat:
                         table_data = pd.DataFrame([flat])
 
-        # Coerce percent-like text to numbers (remove %)
+        # Coerce percent-looking strings
         if table_data is not None and not table_data.empty:
             for c in table_data.columns:
                 if table_data[c].dtype == 'object':
                     try:
-                        table_data[c] = (
-                            table_data[c]
-                            .astype(str)
-                            .str.replace('%', '', regex=False)
-                        )
-                        table_data[c] = pd.to_numeric(table_data[c], errors='ignore')
+                        s = table_data[c].astype(str).str.replace('%', '', regex=False)
+                        table_data[c] = pd.to_numeric(s, errors='ignore')
                     except Exception:
                         pass
 
-            # Fill summary stats
             summary.update(generate_summary(table_data))
 
-            # AI insights
             print(f"🤖 Generating AI insights for result {result_index}...")
-            chart_context = f"Chart analysis result {result_index}"
-            summary['ai_insights'] = analyzer.get_ai_insights(table_data, chart_context)
+            summary['ai_insights'] = analyzer.get_ai_insights(
+                table_data,
+                chart_context=f"Chart analysis result {result_index}",
+                raw_json_snippet=raw_json_for_prompt
+            )
 
-            # Show structured table in console
             print(f"\n=== STRUCTURED TABLE {result_index} ===")
             try:
                 print(table_data.to_string(index=False))
             except Exception:
                 print(table_data.head())
 
-            # Save CSV
             os.makedirs("./output", exist_ok=True)
             csv_path = f"./output/table_{result_index}.csv"
             table_data.to_csv(csv_path, index=False)
@@ -324,22 +298,16 @@ def create_table_and_summary_with_ai(
 
     return table_data, summary
 
-
 def process_chart_results_with_ai(results: Any, analyzer: ChartAnalyzerWithBedrock) -> Tuple[List[pd.DataFrame], List[Dict[str, Any]]]:
-    """
-    Iterate PaddleX results, persist to JSON, reload JSON, structure + AI summarize.
-    Works whether each item is an object with save_to_json(...) or plain dict already.
-    """
     all_tables: List[pd.DataFrame] = []
     all_summaries: List[Dict[str, Any]] = []
-
     os.makedirs("./output", exist_ok=True)
 
     for i, res in enumerate(results):
         print(f"\n---- Processing Result {i} ----")
         json_path = f"./output/res_{i}.json"
 
-        # Try to save to JSON using PaddleX result object
+        # Save each result to JSON
         saved = False
         try:
             if hasattr(res, "save_to_json"):
@@ -352,7 +320,6 @@ def process_chart_results_with_ai(results: Any, analyzer: ChartAnalyzerWithBedro
         except Exception as e:
             print(f"⚠️ Could not save result {i} via save_to_json: {e}")
 
-        # If not saved, try to serialize the object naively
         if not saved:
             try:
                 with open(json_path, 'w', encoding='utf-8') as f:
@@ -361,21 +328,27 @@ def process_chart_results_with_ai(results: Any, analyzer: ChartAnalyzerWithBedro
             except Exception as e:
                 print(f"⚠️ Could not serialize result {i} to JSON: {e}")
 
-        # Load JSON for uniform downstream parsing
+        # Load JSON back for uniform parsing
         if os.path.exists(json_path):
             with open(json_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+            # also prepare a compact raw JSON snippet for the LLM (optional)
+            try:
+                raw_json_for_prompt = json.dumps(data, ensure_ascii=False)[:4000]
+            except Exception:
+                raw_json_for_prompt = None
         else:
             print(f"❌ JSON file not found for result {i}; skipping.")
             continue
 
-        table_data, summary = create_table_and_summary_with_ai(data, i, analyzer)
+        table_data, summary = create_table_and_summary_with_ai(
+            data, i, analyzer, raw_json_for_prompt
+        )
         if isinstance(table_data, pd.DataFrame):
             all_tables.append(table_data)
         all_summaries.append(summary)
 
     return all_tables, all_summaries
-
 
 def print_enhanced_summary(summaries: List[Dict[str, Any]]) -> None:
     print("\n" + "=" * 70)
@@ -400,7 +373,6 @@ def print_enhanced_summary(summaries: List[Dict[str, Any]]) -> None:
                     print(f"    {line}")
         print("-" * 40)
 
-
 # ===========================
 # CLI / Main
 # ===========================
@@ -415,7 +387,6 @@ def prompt_image_path() -> Optional[str]:
         return p
     print("❌ File not found. Please re-run and provide a valid path.")
     return None
-
 
 def main():
     print("🔥 AI-Enhanced Chart Analyzer (PaddleX → JSON → Table → Nova Lite) 🔥")
@@ -440,13 +411,11 @@ def main():
 
         print_enhanced_summary(summaries)
 
-        # Save enhanced summary JSON
         os.makedirs("./output", exist_ok=True)
         with open('./output/ai_enhanced_summary.json', 'w', encoding='utf-8') as f:
             json.dump(summaries, f, indent=2, ensure_ascii=False, default=str)
         print(f"\n💾 Summary saved: ./output/ai_enhanced_summary.json")
 
-        # If multiple tables, also save a combined CSV
         valid_tables = [t for t in tables if isinstance(t, pd.DataFrame) and not t.empty]
         if len(valid_tables) > 1:
             combined = pd.concat(valid_tables, ignore_index=True)
@@ -457,8 +426,7 @@ def main():
 
     except Exception as e:
         print(f"❌ Error during processing: {str(e)}")
-        print("Please verify PaddleX is installed, the image path is valid, and try again.")
-
+        print("Please verify PaddleX is installed, the image path is valid, and your AWS Bedrock permissions are set.")
 
 if __name__ == "__main__":
     main()
