@@ -1,5 +1,5 @@
-# chart_to_ai_summary.py
-# End-to-end: PaddleX → JSON → DataFrame/CSV → Bedrock Nova Lite summary
+# chart_to_ai_summary_final.py
+# End-to-end: PaddleX → JSON → DataFrame/CSV → Bedrock Nova Lite natural summary
 
 import os
 import json
@@ -29,28 +29,28 @@ class ChartAnalyzerWithBedrock:
         if not self.bedrock:
             return "AI summary unavailable – Bedrock not initialized."
 
-        # Build prompt without nested f-strings (prevents backslash-in-expression error)
+        # Build prompt safely (no nested f-strings)
         csv_preview = ""
         try:
             csv_preview = table_df.to_csv(index=False)
         except Exception:
             pass
 
-        parts = []
+        parts: List[str] = []
         parts.append("You are an expert data analyst. Summarize the dataset in simple natural language.")
         if chart_context:
             parts.append(f"Context: {chart_context}")
-        parts.append("Below is the dataset extracted from a chart (CSV):")
+        parts.append("Dataset (CSV):")
         parts.append(csv_preview)
         if raw_json:
-            parts.append("Raw JSON from chart-to-table (for your reference):")
-            parts.append(raw_json)
+            parts.append("Raw JSON from chart-to-table (for reference):")
+            parts.append(raw_json[:4000])  # keep payload small
         parts.append(
             "Please provide:\n"
-            "1) What the dataset represents (if inferable)\n"
+            "1) What the dataset likely represents (one short line)\n"
             "2) Key trends and patterns\n"
             "3) Highest and lowest categories with values\n"
-            "4) Any notable outliers or observations\n"
+            "4) Any notable outliers or data-quality notes\n"
             "Keep it clear and concise (4–6 sentences)."
         )
         prompt = "\n\n".join(parts)
@@ -105,7 +105,7 @@ def parse_pipe_table(text: str) -> Optional[pd.DataFrame]:
 
     df = pd.DataFrame(fixed, columns=header)
 
-    # Coerce numeric-looking columns (strip % then to_numeric with 'coerce' to avoid FutureWarning)
+    # Coerce numeric-looking text → floats (strip % first)
     for col in df.columns:
         if df[col].dtype == "object":
             s = df[col].astype(str).str.replace("%", "", regex=False)
@@ -131,27 +131,38 @@ def flatten_json(json_obj: Any, parent_key: str = "", sep: str = "_") -> Dict[st
 
 def dataframe_from_chart_json(data: Any) -> Optional[pd.DataFrame]:
     """
-    Try multiple shapes:
-      1) {"result": "<pipe table string>"}
-      2) {"table": [...]}
-      3) {"data": [...] or {...}}
-      4) [...] (list of dicts)
-      5) fallback: flatten dict
+    Try multiple shapes that PP-Chart2Table (or similar) might emit.
+    Order matters—most specific → most general.
     """
-    # Case 1: your earlier PP-Chart2Table JSON
+    # 1) Your older shape: {"result": "<pipe-table string>"}
     if isinstance(data, dict) and isinstance(data.get("result"), str):
         df = parse_pipe_table(data["result"])
         if df is not None:
             return df
 
-    # Case 2: 'table'
-    if isinstance(data, dict) and "table" in data:
+    # 2) Nested result container with data/table
+    #    e.g., {"result": {"data": [...]}}, {"result": {"table": [...]}}
+    if isinstance(data, dict) and isinstance(data.get("result"), dict):
+        res = data["result"]
+        if "data" in res and isinstance(res["data"], list):
+            try:
+                return pd.DataFrame(res["data"])
+            except Exception:
+                pass
+        if "table" in res and isinstance(res["table"], list):
+            try:
+                return pd.DataFrame(res["table"])
+            except Exception:
+                pass
+
+    # 3) Direct "table"
+    if isinstance(data, dict) and "table" in data and isinstance(data["table"], list):
         try:
             return pd.DataFrame(data["table"])
         except Exception:
             pass
 
-    # Case 3: 'data'
+    # 4) Direct "data"
     if isinstance(data, dict) and "data" in data:
         if isinstance(data["data"], list):
             try:
@@ -164,14 +175,14 @@ def dataframe_from_chart_json(data: Any) -> Optional[pd.DataFrame]:
             except Exception:
                 pass
 
-    # Case 4: list of dicts
+    # 5) List of dicts
     if isinstance(data, list):
         try:
             return pd.DataFrame(data)
         except Exception:
             pass
 
-    # Case 5: flatten arbitrary dict
+    # 6) Fallback: flatten arbitrary dict to a single-row table
     if isinstance(data, dict):
         flat = flatten_json(data)
         if flat:
@@ -184,7 +195,7 @@ def dataframe_from_chart_json(data: Any) -> Optional[pd.DataFrame]:
 
 
 def generate_numeric_summary(df: pd.DataFrame) -> Dict[str, Any]:
-    """Safe numeric summary (prevents 'method' objects, enforces float)."""
+    """Safe numeric summary (prevents 'method' objects; enforces float)."""
     summary = {
         "total_rows": int(len(df)),
         "total_columns": int(len(df.columns)),
@@ -195,12 +206,13 @@ def generate_numeric_summary(df: pd.DataFrame) -> Dict[str, Any]:
     numeric_cols = df.select_dtypes(include=["number"]).columns
     for col in numeric_cols:
         col_series = pd.to_numeric(df[col], errors="coerce")
+        has_nums = col_series.notna().any()
         summary["key_insights"].append({
             "column": str(col),
-            "min": float((col_series.min(skipna=True) if col_series.notna().any() else 0) or 0),
-            "max": float((col_series.max(skipna=True) if col_series.notna().any() else 0) or 0),
-            "mean": float((col_series.mean(skipna=True) if col_series.notna().any() else 0) or 0),
-            "total": float((col_series.sum(skipna=True) if col_series.notna().any() else 0) or 0),
+            "min": float(col_series.min(skipna=True) if has_nums else 0.0),
+            "max": float(col_series.max(skipna=True) if has_nums else 0.0),
+            "mean": float(col_series.mean(skipna=True) if has_nums else 0.0),
+            "total": float(col_series.sum(skipna=True) if has_nums else 0.0),
         })
     return summary
 
@@ -244,20 +256,22 @@ def process_chart_results_with_ai(results: Any, analyzer: ChartAnalyzerWithBedro
 
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        raw_json_snippet = None
         try:
             raw_json_snippet = json.dumps(data, ensure_ascii=False)[:4000]
         except Exception:
-            pass
+            raw_json_snippet = None
 
         # Build DataFrame from JSON
         df = dataframe_from_chart_json(data)
         if df is None or df.empty:
             print(f"⚠️ Could not construct table for result {i}")
+            # Helpful: show top-level keys to see what came back
+            if isinstance(data, dict):
+                print(f"   Top-level keys: {list(data.keys())}")
             all_summaries.append({"result_index": i, "ai_summary": "No table parsed from JSON."})
             continue
 
-        # Coerce percent-like strings again just in case
+        # Coerce % strings once more just in case
         for c in df.columns:
             if df[c].dtype == "object":
                 s = df[c].astype(str).str.replace("%", "", regex=False)
@@ -273,7 +287,7 @@ def process_chart_results_with_ai(results: Any, analyzer: ChartAnalyzerWithBedro
         except Exception:
             print(df.head())
 
-        # Local numeric summary (for your logs / JSON)
+        # Local numeric summary (for logs / JSON)
         numeric_summary = generate_numeric_summary(df)
 
         # AI natural-language summary
